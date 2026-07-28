@@ -1,7 +1,7 @@
 From be5dfff7d17bf8027304e685b8f9737204b731e4 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 28 Jul 2026 02:33:20 +0000
-Subject: [PATCH] Fix Voice Mode TTS autoplay and improve STT accuracy
+Subject: [PATCH 1/2] Fix Voice Mode TTS autoplay and improve STT accuracy
 
 Unlock audio on Voice Mode click so replies can play after async gaps,
 surface playback failures, force English transcription, use a stronger
@@ -223,6 +223,35 @@ index 8955fc5..e190654 100644
                  if language:
                      kwargs["language"] = language
  
+-- 
+2.43.0
+
+
+From c920728bccb44c421acb827974a718c770b9c3db Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 28 Jul 2026 02:33:39 +0000
+Subject: [PATCH 2/2] Fall back to config speech language for transcription
+
+If the client omits language, use config.speech.language so English
+STT settings apply consistently.
+---
+ src/openjarvis/server/api_routes.py | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/openjarvis/server/api_routes.py b/src/openjarvis/server/api_routes.py
+index 25f90ca..02c3b89 100644
+--- a/src/openjarvis/server/api_routes.py
++++ b/src/openjarvis/server/api_routes.py
+@@ -893,6 +893,9 @@ async def transcribe_speech(request: Request):
+ 
+     audio_bytes = await audio_file.read()
+     language = form.get("language")
++    if not language:
++        config = getattr(request.app.state, "config", None)
++        language = getattr(getattr(config, "speech", None), "language", "") or None
+ 
+     # Detect format from filename
+     filename = getattr(audio_file, "filename", "audio.wav")
 -- 
 2.43.0
 
