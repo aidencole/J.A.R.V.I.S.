@@ -1,0 +1,228 @@
+From be5dfff7d17bf8027304e685b8f9737204b731e4 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 28 Jul 2026 02:33:20 +0000
+Subject: [PATCH] Fix Voice Mode TTS autoplay and improve STT accuracy
+
+Unlock audio on Voice Mode click so replies can play after async gaps,
+surface playback failures, force English transcription, use a stronger
+Whisper decode path, and wait longer before ending utterances.
+---
+ configs/openjarvis/examples/chat-simple.toml |  3 +-
+ frontend/src/hooks/useVoiceConversation.ts   | 24 +++++---
+ frontend/src/lib/api.ts                      | 64 +++++++++++++++++---
+ src/openjarvis/speech/faster_whisper.py      |  6 +-
+ 4 files changed, 79 insertions(+), 18 deletions(-)
+
+diff --git a/configs/openjarvis/examples/chat-simple.toml b/configs/openjarvis/examples/chat-simple.toml
+index 9fc3618..29153b0 100644
+--- a/configs/openjarvis/examples/chat-simple.toml
++++ b/configs/openjarvis/examples/chat-simple.toml
+@@ -28,7 +28,8 @@ port = 8000
+ #   uv pip install kokoro soundfile
+ [speech]
+ backend = "faster-whisper"
+-model = "base"
++model = "small"
++language = "en"
+ device = "cpu"
+ compute_type = "int8"
+ tts_backend = "kokoro"
+diff --git a/frontend/src/hooks/useVoiceConversation.ts b/frontend/src/hooks/useVoiceConversation.ts
+index aa692e6..208e932 100644
+--- a/frontend/src/hooks/useVoiceConversation.ts
++++ b/frontend/src/hooks/useVoiceConversation.ts
+@@ -1,5 +1,5 @@
+ import { useCallback, useEffect, useRef, useState } from 'react';
+-import { fetchSpeechHealth, fetchTtsHealth, stopSpeaking, speakText, transcribeAudio } from '../lib/api';
++import { fetchSpeechHealth, fetchTtsHealth, stopSpeaking, speakText, transcribeAudio, unlockAudio } from '../lib/api';
+ import { streamChat } from '../lib/sse';
+ import { generateId, useAppStore } from '../lib/store';
+ import type { ChatMessage } from '../types';
+@@ -213,7 +213,7 @@ export function useVoiceConversation() {
+         if (enabledRef.current) setPhaseBoth('listening');
+         return;
+       }
+-      const result = await transcribeAudio(blob);
++      const result = await transcribeAudio(blob, 'recording.webm', 'en');
+       const text = (result.text || '').trim();
+       if (!text || text.length < 2) {
+         if (enabledRef.current) setPhaseBoth('listening');
+@@ -224,7 +224,12 @@ export function useVoiceConversation() {
+       if (!enabledRef.current) return;
+ 
+       setPhaseBoth('speaking');
+-      await speakText(reply);
++      try {
++        await speakText(reply);
++      } catch (speakErr) {
++        // Surface TTS/autoplay failures instead of silently continuing.
++        throw speakErr;
++      }
+       if (enabledRef.current) setPhaseBoth('listening');
+     } catch (err) {
+       if (!enabledRef.current) return;
+@@ -289,10 +294,11 @@ export function useVoiceConversation() {
+     const phaseNow = phaseRef.current;
+ 
+     // Thresholds: lower while listening, higher while Jarvis is speaking (echo guard).
+-    const startThreshold = phaseNow === 'speaking' ? 0.09 : 0.045;
+-    const continueThreshold = 0.03;
+-    const speechStartMs = phaseNow === 'speaking' ? 140 : 180;
+-    const silenceEndMs = 700;
++    const startThreshold = phaseNow === 'speaking' ? 0.10 : 0.04;
++    const continueThreshold = 0.025;
++    const speechStartMs = phaseNow === 'speaking' ? 160 : 220;
++    // Wait longer before cutting so trailing words are not clipped.
++    const silenceEndMs = 1100;
+ 
+     if (phaseNow === 'listening' || phaseNow === 'speaking') {
+       if (level >= startThreshold) {
+@@ -314,7 +320,7 @@ export function useVoiceConversation() {
+           ? now - speechStartedAtRef.current
+           : 0;
+         if (
+-          spokenFor > 350 &&
++          spokenFor > 550 &&
+           now - (silenceStartedAtRef.current || now) >= silenceEndMs
+         ) {
+           void finishUtterance();
+@@ -366,6 +372,8 @@ export function useVoiceConversation() {
+     enabledRef.current = true;
+     setEnabled(true);
+     try {
++      // Unlock audio during the click gesture so later TTS can play.
++      await unlockAudio();
+       await startMonitor();
+     } catch {
+       enabledRef.current = false;
+diff --git a/frontend/src/lib/api.ts b/frontend/src/lib/api.ts
+index e876930..7336f47 100644
+--- a/frontend/src/lib/api.ts
++++ b/frontend/src/lib/api.ts
+@@ -332,13 +332,18 @@ export interface SpeechHealth {
+   reason?: string;
+ }
+ 
+-export async function transcribeAudio(audioBlob: Blob, filename = 'recording.webm'): Promise<TranscriptionResult> {
++export async function transcribeAudio(
++  audioBlob: Blob,
++  filename = 'recording.webm',
++  language = 'en',
++): Promise<TranscriptionResult> {
+   if (isTauri()) {
+     try {
+       const buffer = await audioBlob.arrayBuffer();
+       return await tauriInvoke<TranscriptionResult>('transcribe_audio', {
+         audioData: Array.from(new Uint8Array(buffer)),
+         filename,
++        language,
+       });
+     } catch (err) {
+       const msg = err instanceof Error ? err.message : String(err);
+@@ -347,6 +352,7 @@ export async function transcribeAudio(audioBlob: Blob, filename = 'recording.web
+   }
+   const formData = new FormData();
+   formData.append('file', audioBlob, filename);
++  if (language) formData.append('language', language);
+   const res = await apiFetch(`/v1/speech/transcribe`, {
+     method: 'POST',
+     body: formData,
+@@ -412,6 +418,26 @@ export async function synthesizeSpeech(
+ 
+ let _speakAudio: HTMLAudioElement | null = null;
+ let _speakResolve: (() => void) | null = null;
++let _audioUnlocked = false;
++
++/**
++ * Call during a user gesture (button click) so later TTS playback is allowed.
++ * Browsers often block audio after async gaps unless audio was unlocked first.
++ */
++export async function unlockAudio(): Promise<void> {
++  try {
++    const silent = new Audio(
++      'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQQAAAAAAA==',
++    );
++    silent.volume = 0.01;
++    await silent.play();
++    silent.pause();
++    silent.src = '';
++    _audioUnlocked = true;
++  } catch {
++    _audioUnlocked = false;
++  }
++}
+ 
+ /** Stop any in-progress spoken reply (used for barge-in / Voice Mode interrupt). */
+ export function stopSpeaking(): void {
+@@ -432,22 +458,44 @@ export async function speakText(text: string): Promise<void> {
+   const trimmed = text.trim();
+   if (!trimmed) return;
+   stopSpeaking();
++  if (!_audioUnlocked) {
++    await unlockAudio();
++  }
+   const blob = await synthesizeSpeech(trimmed);
+   const url = URL.createObjectURL(blob);
+   const audio = new Audio(url);
++  audio.setAttribute('playsinline', 'true');
+   _speakAudio = audio;
+ 
+-  await new Promise<void>((resolve) => {
+-    const finish = () => {
++  await new Promise<void>((resolve, reject) => {
++    let settled = false;
++    const finishOk = () => {
++      if (settled) return;
++      settled = true;
+       URL.revokeObjectURL(url);
+       if (_speakAudio === audio) _speakAudio = null;
+-      if (_speakResolve === finish) _speakResolve = null;
++      if (_speakResolve === finishOk) _speakResolve = null;
+       resolve();
+     };
+-    _speakResolve = finish;
+-    audio.onended = finish;
+-    audio.onerror = finish;
+-    audio.play().catch(() => finish());
++    const finishErr = (err: Error) => {
++      if (settled) return;
++      settled = true;
++      URL.revokeObjectURL(url);
++      if (_speakAudio === audio) _speakAudio = null;
++      _speakResolve = null;
++      reject(err);
++    };
++    _speakResolve = finishOk;
++    audio.onended = finishOk;
++    audio.onerror = () => finishErr(new Error('Audio playback failed'));
++    audio.play().catch((err) => {
++      const msg = err instanceof Error ? err.message : String(err);
++      finishErr(
++        new Error(
++          `Browser blocked or failed audio playback: ${msg}. Click Voice Mode again, keep the tab focused, and check system volume.`,
++        ),
++      );
++    });
+   });
+ }
+ 
+diff --git a/src/openjarvis/speech/faster_whisper.py b/src/openjarvis/speech/faster_whisper.py
+index 8955fc5..e190654 100644
+--- a/src/openjarvis/speech/faster_whisper.py
++++ b/src/openjarvis/speech/faster_whisper.py
+@@ -116,7 +116,11 @@ class FasterWhisperBackend(SpeechBackend):
+                 with tmp:
+                     tmp.write(audio)
+ 
+-                kwargs = {}
++                kwargs = {
++                    "beam_size": 5,
++                    "vad_filter": True,
++                    "condition_on_previous_text": False,
++                }
+                 if language:
+                     kwargs["language"] = language
+ 
+-- 
+2.43.0
+
