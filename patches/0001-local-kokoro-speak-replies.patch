@@ -1,0 +1,743 @@
+From 418df4c2988da8c837e6ba969efbadb118cdf942 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 28 Jul 2026 02:07:39 +0000
+Subject: [PATCH] Add local Kokoro TTS speak-replies for chat
+
+Wire a local-first TTS synthesize API and a Settings toggle so assistant
+chat replies can be spoken aloud without paid cloud voice APIs.
+---
+ configs/openjarvis/examples/chat-simple.toml |  14 ++-
+ frontend/src/components/Chat/InputArea.tsx   |  20 ++-
+ frontend/src/lib/api.ts                      |  58 +++++++++
+ frontend/src/lib/store.ts                    |   3 +
+ frontend/src/pages/SettingsPage.tsx          |  45 ++++++-
+ pyproject.toml                               |   1 +
+ src/openjarvis/cli/serve.py                  |  12 ++
+ src/openjarvis/core/config.py                |   7 +-
+ src/openjarvis/server/api_routes.py          | 121 +++++++++++++++++++
+ src/openjarvis/server/app.py                 |   2 +
+ src/openjarvis/speech/_discovery.py          |  64 +++++++++-
+ tests/server/test_speech_routes.py           |  84 +++++++++++++
+ tests/speech/test_config.py                  |   3 +
+ tests/speech/test_discovery.py               |  32 +++++
+ 14 files changed, 461 insertions(+), 5 deletions(-)
+
+diff --git a/configs/openjarvis/examples/chat-simple.toml b/configs/openjarvis/examples/chat-simple.toml
+index 4b4c373..9fc3618 100644
+--- a/configs/openjarvis/examples/chat-simple.toml
++++ b/configs/openjarvis/examples/chat-simple.toml
+@@ -20,5 +20,17 @@ default_model = "qwen3.5:4b"       # Fast and lightweight
+ default_agent = "simple"            # Single-turn, no tools
+ 
+ [server]
+-host = "0.0.0.0"
++# Loopback keeps the API on this PC only (no API key required).
++host = "127.0.0.1"
+ port = 8000
++
++# Local voice: STT (Whisper) + TTS (Kokoro). Install TTS with:
++#   uv pip install kokoro soundfile
++[speech]
++backend = "faster-whisper"
++model = "base"
++device = "cpu"
++compute_type = "int8"
++tts_backend = "kokoro"
++tts_voice_id = "am_adam"
++tts_speed = 1.0
+diff --git a/frontend/src/components/Chat/InputArea.tsx b/frontend/src/components/Chat/InputArea.tsx
+index a3ed970..be0edb4 100644
+--- a/frontend/src/components/Chat/InputArea.tsx
++++ b/frontend/src/components/Chat/InputArea.tsx
+@@ -3,7 +3,7 @@ import { Send, Square, Paperclip, Search } from 'lucide-react';
+ import { toast } from 'sonner';
+ import { useAppStore, generateId } from '../../lib/store';
+ import { streamChat, streamResearch } from '../../lib/sse';
+-import { fetchSavings, getBase } from '../../lib/api';
++import { fetchSavings, getBase, speakText } from '../../lib/api';
+ import { listConnectors, getSyncStatus } from '../../lib/connectors-api';
+ import { MicButton } from './MicButton';
+ import { useSpeech } from '../../hooks/useSpeech';
+@@ -85,6 +85,7 @@ export function InputArea() {
+   const streamState = useAppStore((s) => s.streamState);
+   const messages = useAppStore((s) => s.messages);
+   const speechEnabled = useAppStore((s) => s.settings.speechEnabled);
++  const speakRepliesEnabled = useAppStore((s) => s.settings.speakRepliesEnabled);
+   const maxTokens = useAppStore((s) => s.settings.maxTokens);
+   const temperature = useAppStore((s) => s.settings.temperature);
+   const createConversation = useAppStore((s) => s.createConversation);
+@@ -503,6 +504,22 @@ export function InputArea() {
+         researchTraces.length > 0 ? researchTraces : undefined,
+         researchSourcesByRef.size > 0 ? flushSources() : undefined,
+       );
++      if (
++        speakRepliesEnabled &&
++        accumulatedContent &&
++        !accumulatedContent.startsWith('Error:') &&
++        accumulatedContent !== '(Generation stopped)'
++      ) {
++        speakText(accumulatedContent).catch((err) => {
++          const msg = err instanceof Error ? err.message : String(err);
++          useAppStore.getState().addLogEntry({
++            timestamp: Date.now(),
++            level: 'warn',
++            category: 'speech',
++            message: `Speak reply failed: ${msg}`,
++          });
++        });
++      }
+       if (timerRef.current) {
+         clearInterval(timerRef.current);
+         timerRef.current = null;
+@@ -537,6 +554,7 @@ export function InputArea() {
+     deepResearch,
+     temperature,
+     maxTokens,
++    speakRepliesEnabled,
+   ]);
+ 
+   const handleKeyDown = (e: React.KeyboardEvent) => {
+diff --git a/frontend/src/lib/api.ts b/frontend/src/lib/api.ts
+index 588e5c2..d1476e5 100644
+--- a/frontend/src/lib/api.ts
++++ b/frontend/src/lib/api.ts
+@@ -377,6 +377,64 @@ export async function fetchSpeechHealth(): Promise<SpeechHealth> {
+   return res.json();
+ }
+ 
++export async function fetchTtsHealth(): Promise<SpeechHealth> {
++  const res = await apiFetch(`/v1/speech/tts/health`);
++  if (!res.ok) return { available: false };
++  return res.json();
++}
++
++/** Synthesize text to audio (local Kokoro by default when configured). */
++export async function synthesizeSpeech(
++  text: string,
++  opts?: { voiceId?: string; speed?: number },
++): Promise<Blob> {
++  const res = await apiFetch(`/v1/speech/synthesize`, {
++    method: 'POST',
++    headers: { 'Content-Type': 'application/json' },
++    body: JSON.stringify({
++      text,
++      ...(opts?.voiceId ? { voice_id: opts.voiceId } : {}),
++      ...(opts?.speed != null ? { speed: opts.speed } : {}),
++    }),
++  });
++  if (!res.ok) {
++    let detail = '';
++    try {
++      const body = await res.json();
++      detail = typeof body.detail === 'string' ? body.detail : '';
++    } catch {
++      // Keep status-only message when body is not JSON.
++    }
++    throw new Error(detail || `Speech synthesis failed: ${res.status}`);
++  }
++  return res.blob();
++}
++
++let _speakAudio: HTMLAudioElement | null = null;
++
++/** Speak text aloud via the server TTS endpoint. Stops any previous clip. */
++export async function speakText(text: string): Promise<void> {
++  const trimmed = text.trim();
++  if (!trimmed) return;
++  const blob = await synthesizeSpeech(trimmed);
++  const url = URL.createObjectURL(blob);
++  if (_speakAudio) {
++    _speakAudio.pause();
++    _speakAudio.src = '';
++  }
++  const audio = new Audio(url);
++  _speakAudio = audio;
++  audio.onended = () => {
++    URL.revokeObjectURL(url);
++    if (_speakAudio === audio) _speakAudio = null;
++  };
++  audio.onerror = () => {
++    URL.revokeObjectURL(url);
++    if (_speakAudio === audio) _speakAudio = null;
++  };
++  await audio.play();
++}
++
+ // ---------------------------------------------------------------------------
+ // Agent Manager
+ // ---------------------------------------------------------------------------
+diff --git a/frontend/src/lib/store.ts b/frontend/src/lib/store.ts
+index d1a0775..b7eb7ba 100644
+--- a/frontend/src/lib/store.ts
++++ b/frontend/src/lib/store.ts
+@@ -80,6 +80,8 @@ interface Settings {
+   temperature: number;
+   maxTokens: number;
+   speechEnabled: boolean;
++  /** When true, assistant replies are spoken aloud via local/cloud TTS. */
++  speakRepliesEnabled: boolean;
+ }
+ 
+ function loadSettings(): Settings {
+@@ -93,6 +95,7 @@ function loadSettings(): Settings {
+     temperature: 0.7,
+     maxTokens: 4096,
+     speechEnabled: false,
++    speakRepliesEnabled: false,
+   };
+   try {
+     const raw = localStorage.getItem(SETTINGS_KEY);
+diff --git a/frontend/src/pages/SettingsPage.tsx b/frontend/src/pages/SettingsPage.tsx
+index f53029d..1b88ad2 100644
+--- a/frontend/src/pages/SettingsPage.tsx
++++ b/frontend/src/pages/SettingsPage.tsx
+@@ -22,6 +22,7 @@ import { useAppStore, type ThemeMode } from '../lib/store';
+ import {
+   checkHealth,
+   fetchSpeechHealth,
++  fetchTtsHealth,
+   getMemoryStats,
+   getInferenceSource,
+   setInferenceSource,
+@@ -213,6 +214,7 @@ export function SettingsPage() {
+   const serverInfo = useAppStore((s) => s.serverInfo);
+   const [healthy, setHealthy] = useState<boolean | null>(null);
+   const [speechBackendAvailable, setSpeechBackendAvailable] = useState<boolean | null>(null);
++  const [ttsBackendAvailable, setTtsBackendAvailable] = useState<boolean | null>(null);
+   const [saved, setSaved] = useState(false);
+ 
+   const [autoUpdateEnabled, setAutoUpdateEnabled] = useState(() => !isAutoUpdateDisabled());
+@@ -287,6 +289,9 @@ export function SettingsPage() {
+     fetchSpeechHealth()
+       .then((h) => setSpeechBackendAvailable(h.available))
+       .catch(() => setSpeechBackendAvailable(false));
++    fetchTtsHealth()
++      .then((h) => setTtsBackendAvailable(h.available))
++      .catch(() => setTtsBackendAvailable(false));
+     getMemoryStats()
+       .then(setMemoryStats)
+       .catch(() => setMemoryStats(null));
+@@ -695,7 +700,7 @@ export function SettingsPage() {
+                 />
+               </button>
+             </SettingRow>
+-            <SettingRow label="Backend status" description="Requires Whisper, Deepgram, or another speech backend">
++            <SettingRow label="STT backend" description="Requires Whisper, Deepgram, or another speech backend">
+               <div className="flex items-center gap-2">
+                 <span
+                   className="w-2 h-2 rounded-full"
+@@ -712,12 +717,50 @@ export function SettingsPage() {
+                 </span>
+               </div>
+             </SettingRow>
++            <SettingRow label="Speak replies" description="Read assistant answers aloud with local TTS (Kokoro)">
++              <button
++                onClick={() => { updateSettings({ speakRepliesEnabled: !settings.speakRepliesEnabled }); showSaved(); }}
++                className="relative w-11 h-6 rounded-full transition-colors cursor-pointer"
++                style={{
++                  background: settings.speakRepliesEnabled ? 'var(--color-accent)' : 'var(--color-bg-tertiary)',
++                }}
++              >
++                <span
++                  className="absolute top-0.5 left-0.5 w-5 h-5 rounded-full transition-transform bg-white"
++                  style={{
++                    transform: settings.speakRepliesEnabled ? 'translateX(20px)' : 'translateX(0)',
++                    boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
++                  }}
++                />
++              </button>
++            </SettingRow>
++            <SettingRow label="TTS backend" description="Local Kokoro by default when installed">
++              <div className="flex items-center gap-2">
++                <span
++                  className="w-2 h-2 rounded-full"
++                  style={{
++                    background: ttsBackendAvailable === true ? 'var(--color-success)'
++                      : 'var(--color-text-tertiary)',
++                  }}
++                />
++                <span className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
++                  {ttsBackendAvailable === null ? 'Checking...'
++                    : ttsBackendAvailable ? 'Available'
++                    : 'Not configured'}
++                </span>
++              </div>
++            </SettingRow>
+             {!speechBackendAvailable && speechBackendAvailable !== null && (
+               <div className="text-xs mt-2 px-1" style={{ color: 'var(--color-text-tertiary)' }}>
+                 Set up a speech backend to use voice input.
+                 See the <a href="https://open-jarvis.github.io/OpenJarvis/user-guide/tools/" target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-accent)' }}>documentation</a> for details.
+               </div>
+             )}
++            {!ttsBackendAvailable && ttsBackendAvailable !== null && (
++              <div className="text-xs mt-2 px-1" style={{ color: 'var(--color-text-tertiary)' }}>
++                Install local TTS with: <code>uv pip install kokoro soundfile</code>, then restart <code>jarvis serve</code>.
++              </div>
++            )}
+           </Section>
+ 
+           {/* Data */}
+diff --git a/pyproject.toml b/pyproject.toml
+index 6e253ed..ca4f166 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -131,6 +131,7 @@ sandbox-docker = ["docker>=7.0"]
+ dashboard = ["textual>=0.80"]
+ speech = ["faster-whisper>=1.0"]
+ speech-deepgram = ["deepgram-sdk>=3.0"]
++tts-kokoro = ["kokoro>=0.9.2", "soundfile>=0.12"]
+ eval-wandb = ["wandb>=0.17"]
+ eval-sheets = ["gspread>=6.0", "google-auth>=2.0"]
+ mining-pearl-cpu = [
+diff --git a/src/openjarvis/cli/serve.py b/src/openjarvis/cli/serve.py
+index ed95c35..7024b0e 100644
+--- a/src/openjarvis/cli/serve.py
++++ b/src/openjarvis/cli/serve.py
+@@ -472,6 +472,17 @@ def serve(
+     except Exception as exc:
+         logger.debug("Speech backend discovery failed: %s", exc)
+ 
++    # Set up local-first TTS backend (Kokoro preferred)
++    tts_backend = None
++    try:
++        from openjarvis.speech._discovery import get_tts_backend
++
++        tts_backend = get_tts_backend(config)
++        if tts_backend:
++            console.print(f"  TTS: [cyan]{tts_backend.backend_id}[/cyan]")
++    except Exception as exc:
++        logger.debug("TTS backend discovery failed: %s", exc)
++
+     # Create app
+     from openjarvis.server.app import create_app
+ 
+@@ -687,6 +698,7 @@ def serve(
+         memory_backend=memory_backend,
+         memory_service=memory_service,
+         speech_backend=speech_backend,
++        tts_backend=tts_backend,
+         agent_manager=agent_manager,
+         agent_scheduler=agent_scheduler,
+         api_key=api_key,
+diff --git a/src/openjarvis/core/config.py b/src/openjarvis/core/config.py
+index 593bfa1..1349a79 100644
+--- a/src/openjarvis/core/config.py
++++ b/src/openjarvis/core/config.py
+@@ -1440,13 +1440,18 @@ class OperatorsConfig:
+ 
+ @dataclass(slots=True)
+ class SpeechConfig:
+-    """Speech-to-text settings."""
++    """Speech-to-text and text-to-speech settings."""
+ 
+     backend: str = "auto"  # "auto", "faster-whisper", "openai", "deepgram"
+     model: str = "base"  # Whisper model size: tiny, base, small, medium, large-v3
+     language: str = ""  # Empty = auto-detect
+     device: str = "auto"  # "auto", "cpu", "cuda"
+     compute_type: str = "float16"  # "float16", "int8", "float32"
++    # Local-first TTS. "auto" prefers kokoro, then cloud backends if keys exist.
++    tts_backend: str = "auto"  # "auto", "kokoro", "openai_tts", "cartesia"
++    tts_voice_id: str = "am_adam"
++    tts_speed: float = 1.0
++
+ 
+ 
+ @dataclass(slots=True)
+diff --git a/src/openjarvis/server/api_routes.py b/src/openjarvis/server/api_routes.py
+index b70b4f5..25f90ca 100644
+--- a/src/openjarvis/server/api_routes.py
++++ b/src/openjarvis/server/api_routes.py
+@@ -946,6 +946,127 @@ async def speech_health(request: Request):
+     }
+ 
+ 
++def _plain_text_for_tts(text: str) -> str:
++    """Lightly strip markdown so spoken replies sound more natural."""
++    import re
++
++    cleaned = re.sub(r"```[\s\S]*?```", " ", text)
++    cleaned = re.sub(r"`([^`]+)`", r"\1", cleaned)
++    cleaned = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)
++    cleaned = re.sub(r"[#*_>]+", "", cleaned)
++    cleaned = re.sub(r"\s+", " ", cleaned).strip()
++    return cleaned
++
++
++@speech_router.get("/tts/health")
++async def tts_health(request: Request):
++    """Check if a text-to-speech backend is available."""
++    backend = getattr(request.app.state, "tts_backend", None)
++    if backend is None:
++        return {
++            "available": False,
++            "reason": (
++                "No TTS backend configured. Install Kokoro with: "
++                "uv pip install kokoro soundfile"
++            ),
++        }
++    try:
++        available = backend.health() if hasattr(backend, "health") else True
++        reason = None
++    except Exception as exc:
++        logger.exception("TTS health check failed")
++        available = False
++        reason = str(exc)
++    return {
++        "available": bool(available),
++        "backend": getattr(backend, "backend_id", "unknown"),
++        **({"reason": reason} if reason else {}),
++    }
++
++
++@speech_router.post("/synthesize")
++async def synthesize_speech(request: Request):
++    """Synthesize text to spoken audio using the configured TTS backend."""
++    from fastapi.responses import Response
++
++    backend = getattr(request.app.state, "tts_backend", None)
++    if backend is None:
++        raise HTTPException(
++            status_code=501,
++            detail=(
++                "TTS backend not configured. Install Kokoro with: "
++                "uv pip install kokoro soundfile"
++            ),
++        )
++
++    try:
++        payload = await request.json()
++    except Exception as exc:
++        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
++
++    text = str(payload.get("text", "")).strip()
++    if not text:
++        raise HTTPException(status_code=400, detail="Missing 'text' field")
++
++    # Guardrail against accidental huge synthesis jobs.
++    if len(text) > 4000:
++        text = text[:4000]
++
++    config = getattr(request.app.state, "config", None)
++    voice_id = str(payload.get("voice_id") or "").strip()
++    if not voice_id and config is not None:
++        voice_id = getattr(config.speech, "tts_voice_id", "") or ""
++    if not voice_id:
++        voice_id = "am_adam"
++
++    speed = payload.get("speed")
++    if speed is None and config is not None:
++        speed = getattr(config.speech, "tts_speed", 1.0)
++    try:
++        speed_f = float(speed if speed is not None else 1.0)
++    except (TypeError, ValueError):
++        speed_f = 1.0
++
++    plain = _plain_text_for_tts(text)
++    if not plain:
++        raise HTTPException(status_code=400, detail="No speakable text after cleanup")
++
++    try:
++        result = await asyncio.to_thread(
++            backend.synthesize,
++            plain,
++            voice_id=voice_id,
++            speed=speed_f,
++        )
++    except Exception as exc:
++        logger.exception("TTS synthesis failed")
++        raise HTTPException(
++            status_code=500,
++            detail=f"TTS synthesis failed: {exc}",
++        ) from exc
++
++    audio = getattr(result, "audio", b"") or b""
++    if not audio:
++        raise HTTPException(status_code=500, detail="TTS backend returned empty audio")
++
++    fmt = (getattr(result, "format", None) or "wav").lower()
++    media_types = {
++        "wav": "audio/wav",
++        "mp3": "audio/mpeg",
++        "ogg": "audio/ogg",
++        "flac": "audio/flac",
++    }
++    return Response(
++        content=audio,
++        media_type=media_types.get(fmt, "application/octet-stream"),
++        headers={
++            "X-TTS-Backend": getattr(backend, "backend_id", "unknown"),
++            "X-TTS-Voice": getattr(result, "voice_id", voice_id) or voice_id,
++            "X-TTS-Format": fmt,
++        },
++    )
++
++
+ # ---- Feedback routes ----
+ 
+ feedback_router = APIRouter(prefix="/v1/feedback", tags=["feedback"])
+diff --git a/src/openjarvis/server/app.py b/src/openjarvis/server/app.py
+index 35d4284..ae23e10 100644
+--- a/src/openjarvis/server/app.py
++++ b/src/openjarvis/server/app.py
+@@ -153,6 +153,7 @@ def create_app(
+     memory_backend=None,
+     memory_service=None,
+     speech_backend=None,
++    tts_backend=None,
+     agent_manager=None,
+     agent_scheduler=None,
+     api_key: str = "",
+@@ -224,6 +225,7 @@ def create_app(
+     app.state.memory_backend = memory_backend
+     app.state.memory_service = memory_service
+     app.state.speech_backend = speech_backend
++    app.state.tts_backend = tts_backend
+     app.state.agent_manager = agent_manager
+     app.state.agent_scheduler = agent_scheduler
+     app.state.session_start = time.time()
+diff --git a/src/openjarvis/speech/_discovery.py b/src/openjarvis/speech/_discovery.py
+index 0319193..524aca3 100644
+--- a/src/openjarvis/speech/_discovery.py
++++ b/src/openjarvis/speech/_discovery.py
+@@ -1,4 +1,4 @@
+-"""Auto-discover available speech-to-text backends."""
++"""Auto-discover available speech-to-text and text-to-speech backends."""
+ 
+ from __future__ import annotations
+ 
+@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Optional
+ if TYPE_CHECKING:
+     from openjarvis.core.config import JarvisConfig
+     from openjarvis.speech._stubs import SpeechBackend
++    from openjarvis.speech.tts import TTSBackend
+ 
+ # Priority order: local first, then cloud
+ DISCOVERY_ORDER = [
+@@ -16,6 +17,13 @@ DISCOVERY_ORDER = [
+     "deepgram",
+ ]
+ 
++# Prefer free local TTS before cloud providers.
++TTS_DISCOVERY_ORDER = [
++    "kokoro",
++    "openai_tts",
++    "cartesia",
++]
++
+ 
+ def _create_backend(
+     key: str,
+@@ -73,3 +81,57 @@ def get_speech_backend(config: "JarvisConfig") -> Optional["SpeechBackend"]:
+             return backend
+ 
+     return None
++
++
++def _create_tts_backend(
++    key: str,
++    config: "JarvisConfig",
++) -> Optional["TTSBackend"]:
++    """Try to instantiate a TTS backend by registry key."""
++    from openjarvis.core.registry import TTSRegistry
++
++    if not TTSRegistry.contains(key):
++        return None
++
++    try:
++        backend_cls = TTSRegistry.get(key)
++        if key == "openai_tts":
++            api_key = os.environ.get("OPENAI_API_KEY", "")
++            if not api_key:
++                return None
++            return backend_cls(api_key=api_key)
++        if key == "cartesia":
++            api_key = os.environ.get("CARTESIA_API_KEY", "")
++            if not api_key:
++                return None
++            return backend_cls(api_key=api_key)
++        backend = backend_cls()
++        # Skip local backends that are registered but not installable yet.
++        if hasattr(backend, "health") and not backend.health():
++            return None
++        return backend
++    except Exception:
++        return None
++
++
++def get_tts_backend(config: "JarvisConfig") -> Optional["TTSBackend"]:
++    """Resolve the TTS backend from config.
++
++    If ``config.speech.tts_backend`` is ``"auto"``, prefers local Kokoro,
++    then cloud backends when API keys are present.
++    """
++    import openjarvis.speech  # noqa: F401
++
++    backend_key = getattr(config.speech, "tts_backend", "auto") or "auto"
++    aliases = {"openai": "openai_tts"}
++    backend_key = aliases.get(backend_key, backend_key)
++
++    if backend_key != "auto":
++        return _create_tts_backend(backend_key, config)
++
++    for key in TTS_DISCOVERY_ORDER:
++        backend = _create_tts_backend(key, config)
++        if backend is not None:
++            return backend
++
++    return None
+diff --git a/tests/server/test_speech_routes.py b/tests/server/test_speech_routes.py
+index d539036..4bf2ffa 100644
+--- a/tests/server/test_speech_routes.py
++++ b/tests/server/test_speech_routes.py
+@@ -130,6 +130,7 @@ def test_health_no_backend():
+ 
+     app = FastAPI()
+     app.state.speech_backend = None
++    app.state.tts_backend = None
+     app.include_router(speech_router)
+     client = TestClient(app)
+ 
+@@ -137,3 +138,86 @@ def test_health_no_backend():
+     assert response.status_code == 200
+     data = response.json()
+     assert data["available"] is False
++
++
++@pytest.fixture
++def mock_tts_backend():
++    from openjarvis.speech.tts import TTSResult
++
++    backend = MagicMock()
++    backend.backend_id = "kokoro"
++    backend.health.return_value = True
++    backend.synthesize.return_value = TTSResult(
++        audio=b"RIFF****WAVEfmt ",
++        format="wav",
++        voice_id="am_adam",
++        duration_seconds=1.0,
++    )
++    return backend
++
++
++@pytest.fixture
++def client_with_tts(mock_speech_backend, mock_tts_backend):
++    from fastapi import FastAPI
++
++    from openjarvis.server.api_routes import speech_router
++
++    app = FastAPI()
++    app.state.speech_backend = mock_speech_backend
++    app.state.tts_backend = mock_tts_backend
++    app.state.config = None
++    app.include_router(speech_router)
++    return TestClient(app)
++
++
++def test_tts_health_endpoint(client_with_tts):
++    response = client_with_tts.get("/v1/speech/tts/health")
++    assert response.status_code == 200
++    data = response.json()
++    assert data["available"] is True
++    assert data["backend"] == "kokoro"
++
++
++def test_tts_health_no_backend():
++    from fastapi import FastAPI
++
++    from openjarvis.server.api_routes import speech_router
++
++    app = FastAPI()
++    app.state.speech_backend = None
++    app.state.tts_backend = None
++    app.include_router(speech_router)
++    client = TestClient(app)
++    response = client.get("/v1/speech/tts/health")
++    assert response.status_code == 200
++    assert response.json()["available"] is False
++
++
++def test_synthesize_endpoint(client_with_tts, mock_tts_backend):
++    response = client_with_tts.post(
++        "/v1/speech/synthesize",
++        json={"text": "Hello Aiden"},
++    )
++    assert response.status_code == 200
++    assert response.headers["content-type"].startswith("audio/")
++    assert response.content.startswith(b"RIFF")
++    mock_tts_backend.synthesize.assert_called_once()
++
++
++def test_synthesize_requires_text(client_with_tts):
++    response = client_with_tts.post("/v1/speech/synthesize", json={"text": "  "})
++    assert response.status_code == 400
++
++
++def test_synthesize_no_backend(mock_speech_backend):
++    from fastapi import FastAPI
++
++    from openjarvis.server.api_routes import speech_router
++
++    app = FastAPI()
++    app.state.speech_backend = mock_speech_backend
++    app.state.tts_backend = None
++    app.include_router(speech_router)
++    client = TestClient(app)
++    response = client.post("/v1/speech/synthesize", json={"text": "hi"})
++    assert response.status_code == 501
+diff --git a/tests/speech/test_config.py b/tests/speech/test_config.py
+index 8f3658e..ada3964 100644
+--- a/tests/speech/test_config.py
++++ b/tests/speech/test_config.py
+@@ -10,6 +10,9 @@ def test_speech_config_defaults():
+     assert cfg.language == ""
+     assert cfg.device == "auto"
+     assert cfg.compute_type == "float16"
++    assert cfg.tts_backend == "auto"
++    assert cfg.tts_voice_id == "am_adam"
++    assert cfg.tts_speed == 1.0
+ 
+ 
+ def test_jarvis_config_has_speech():
+diff --git a/tests/speech/test_discovery.py b/tests/speech/test_discovery.py
+index 50f4422..c4beb6f 100644
+--- a/tests/speech/test_discovery.py
++++ b/tests/speech/test_discovery.py
+@@ -46,3 +46,35 @@ def test_auto_discovery_priority():
+     assert DISCOVERY_ORDER[0] == "faster-whisper"
+     assert "openai" in DISCOVERY_ORDER
+     assert "deepgram" in DISCOVERY_ORDER
++
++
++def test_tts_discovery_prefers_kokoro():
++    from openjarvis.speech._discovery import TTS_DISCOVERY_ORDER
++
++    assert TTS_DISCOVERY_ORDER[0] == "kokoro"
++
++
++def test_get_tts_backend_explicit_kokoro():
++    from openjarvis.speech._discovery import get_tts_backend
++
++    config = JarvisConfig()
++    config.speech.tts_backend = "kokoro"
++
++    with patch("openjarvis.speech._discovery._create_tts_backend") as mock_create:
++        mock_backend = type(
++            "MockTTS",
++            (),
++            {"backend_id": "kokoro", "health": lambda self: True},
++        )()
++        mock_create.return_value = mock_backend
++        result = get_tts_backend(config)
++        assert result is not None
++        assert result.backend_id == "kokoro"
++
++
++def test_get_tts_backend_returns_none_if_missing():
++    from openjarvis.speech._discovery import get_tts_backend
++
++    config = JarvisConfig()
++    config.speech.tts_backend = "nonexistent"
++    assert get_tts_backend(config) is None
+-- 
+2.43.0
+

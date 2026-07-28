@@ -1,0 +1,637 @@
+From e9571afce1c5949eb3bebc1de0faeb13a3cd32d4 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 28 Jul 2026 02:25:38 +0000
+Subject: [PATCH] Add always-listening Voice Mode with barge-in
+
+Introduce a Voice Mode loop that keeps the mic open while enabled,
+transcribes utterances, replies via chat+TTS, and lets the user
+interrupt spoken replies by talking over Jarvis.
+---
+ frontend/src/components/Chat/InputArea.tsx    |  30 +-
+ .../src/components/Chat/VoiceModeButton.tsx   |  69 +++
+ frontend/src/hooks/useVoiceConversation.ts    | 407 ++++++++++++++++++
+ frontend/src/lib/api.ts                       |  44 +-
+ 4 files changed, 535 insertions(+), 15 deletions(-)
+ create mode 100644 frontend/src/components/Chat/VoiceModeButton.tsx
+ create mode 100644 frontend/src/hooks/useVoiceConversation.ts
+
+diff --git a/frontend/src/components/Chat/InputArea.tsx b/frontend/src/components/Chat/InputArea.tsx
+index be0edb4..5e86459 100644
+--- a/frontend/src/components/Chat/InputArea.tsx
++++ b/frontend/src/components/Chat/InputArea.tsx
+@@ -6,7 +6,9 @@ import { streamChat, streamResearch } from '../../lib/sse';
+ import { fetchSavings, getBase, speakText } from '../../lib/api';
+ import { listConnectors, getSyncStatus } from '../../lib/connectors-api';
+ import { MicButton } from './MicButton';
++import { VoiceModeButton } from './VoiceModeButton';
+ import { useSpeech } from '../../hooks/useSpeech';
++import { useVoiceConversation } from '../../hooks/useVoiceConversation';
+ import type {
+   ChatMessage,
+   MessageTelemetry,
+@@ -106,6 +108,14 @@ export function InputArea() {
+     stopRecording,
+   } = useSpeech();
+ 
++  const voice = useVoiceConversation();
++
++  useEffect(() => {
++    if (voice.error) {
++      toast.error(voice.error, { duration: 8000 });
++    }
++  }, [voice.error]);
++
+   // Abort in-flight stream when the user switches models mid-generation.
+   // This prevents errors from trying to continue a stream with a stale model.
+   const prevModelRef = useRef(selectedModel);
+@@ -568,10 +578,23 @@ export function InputArea() {
+     <div className="px-4 pb-4 pt-2" style={{ maxWidth: 'var(--chat-max-width)', margin: '0 auto', width: '100%' }}>
+       <div className="mb-2 flex flex-col gap-1">
+         <div className="flex items-center gap-2">
++          <VoiceModeButton
++            enabled={voice.enabled}
++            phase={voice.phase}
++            disabled={modelLoading || !selectedModel}
++            onClick={voice.toggle}
++            title={
++              !selectedModel
++                ? 'Pick a model first'
++                : voice.enabled
++                  ? 'Stop always-listening Voice Mode'
++                  : 'Start always-listening Voice Mode (talk to interrupt)'
++            }
++          />
+           <button
+             type="button"
+             onClick={() => setDeepResearch(!deepResearch)}
+-            disabled={streamState.isStreaming}
++            disabled={streamState.isStreaming || voice.enabled}
+             aria-pressed={deepResearch}
+             className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs transition-colors cursor-pointer disabled:cursor-default disabled:opacity-50"
+             style={{
+@@ -585,6 +608,11 @@ export function InputArea() {
+             Deep Research
+           </button>
+         </div>
++        {voice.enabled && (
++          <div className="text-[11px] leading-snug" style={{ color: 'var(--color-text-tertiary)' }}>
++            Voice Mode is always listening while on. Speak naturally; talk over Jarvis to interrupt.
++          </div>
++        )}
+         {deepResearch && corpusSync.syncing && corpusSync.itemsSynced > 0 && (
+           <div
+             className="text-[11px] leading-snug"
+diff --git a/frontend/src/components/Chat/VoiceModeButton.tsx b/frontend/src/components/Chat/VoiceModeButton.tsx
+new file mode 100644
+index 0000000..dc3faf3
+--- /dev/null
++++ b/frontend/src/components/Chat/VoiceModeButton.tsx
+@@ -0,0 +1,69 @@
++import type { VoicePhase } from '../../hooks/useVoiceConversation';
++
++interface VoiceModeButtonProps {
++  enabled: boolean;
++  phase: VoicePhase;
++  disabled?: boolean;
++  title?: string;
++  onClick: () => void;
++}
++
++function labelFor(phase: VoicePhase, enabled: boolean): string {
++  if (!enabled) return 'Voice Mode';
++  switch (phase) {
++    case 'listening':
++      return 'Listening…';
++    case 'recording':
++      return 'Hearing you…';
++    case 'thinking':
++      return 'Thinking…';
++    case 'speaking':
++      return 'Speaking… (talk to interrupt)';
++    case 'error':
++      return 'Voice error';
++    default:
++      return 'Voice Mode on';
++  }
++}
++
++export function VoiceModeButton({
++  enabled,
++  phase,
++  disabled,
++  title,
++  onClick,
++}: VoiceModeButtonProps) {
++  const active = enabled && phase !== 'off';
++  const pulse = phase === 'listening' || phase === 'recording' || phase === 'speaking';
++
++  return (
++    <button
++      type="button"
++      onClick={onClick}
++      disabled={disabled}
++      title={title || (enabled ? 'Stop Voice Mode' : 'Start always-listening Voice Mode')}
++      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs transition-colors cursor-pointer disabled:cursor-default disabled:opacity-50"
++      style={{
++        background: active ? 'var(--color-accent-subtle)' : 'transparent',
++        border: `1px solid ${active ? 'var(--color-accent)' : 'var(--color-border)'}`,
++        color: active ? 'var(--color-accent)' : 'var(--color-text-tertiary)',
++        animation: pulse ? 'pulse 1.6s ease-in-out infinite' : 'none',
++      }}
++    >
++      <span
++        className="inline-block w-1.5 h-1.5 rounded-full"
++        style={{
++          background:
++            phase === 'recording'
++              ? 'var(--color-error)'
++              : phase === 'speaking'
++                ? 'var(--color-accent)'
++                : active
++                  ? 'var(--color-success)'
++                  : 'var(--color-text-tertiary)',
++        }}
++      />
++      {labelFor(phase, enabled)}
++    </button>
++  );
++}
+diff --git a/frontend/src/hooks/useVoiceConversation.ts b/frontend/src/hooks/useVoiceConversation.ts
+new file mode 100644
+index 0000000..aa692e6
+--- /dev/null
++++ b/frontend/src/hooks/useVoiceConversation.ts
+@@ -0,0 +1,407 @@
++import { useCallback, useEffect, useRef, useState } from 'react';
++import { fetchSpeechHealth, fetchTtsHealth, stopSpeaking, speakText, transcribeAudio } from '../lib/api';
++import { streamChat } from '../lib/sse';
++import { generateId, useAppStore } from '../lib/store';
++import type { ChatMessage } from '../types';
++
++export type VoicePhase =
++  | 'off'
++  | 'listening'
++  | 'recording'
++  | 'thinking'
++  | 'speaking'
++  | 'error';
++
++type VoiceStatus = {
++  stt: boolean;
++  tts: boolean;
++};
++
++function rmsFromAnalyser(analyser: AnalyserNode, buffer: Uint8Array): number {
++  // Cast keeps TS happy across lib.dom ArrayBuffer typing variants.
++  analyser.getByteTimeDomainData(buffer as unknown as Uint8Array<ArrayBuffer>);
++  let sum = 0;
++  for (let i = 0; i < buffer.length; i++) {
++    const v = (buffer[i] - 128) / 128;
++    sum += v * v;
++  }
++  return Math.sqrt(sum / buffer.length);
++}
++
++/**
++ * Always-on Voice Mode while enabled:
++ * listen → transcribe → reply → speak → listen again.
++ * Talking over Jarvis interrupts speech (barge-in).
++ */
++export function useVoiceConversation() {
++  const [enabled, setEnabled] = useState(false);
++  const [phase, setPhase] = useState<VoicePhase>('off');
++  const [error, setError] = useState<string | null>(null);
++  const [status, setStatus] = useState<VoiceStatus>({ stt: false, tts: false });
++
++  const enabledRef = useRef(false);
++  const phaseRef = useRef<VoicePhase>('off');
++  const streamRef = useRef<MediaStream | null>(null);
++  const audioCtxRef = useRef<AudioContext | null>(null);
++  const analyserRef = useRef<AnalyserNode | null>(null);
++  const meterBufRef = useRef<Uint8Array | null>(null);
++  const rafRef = useRef<number | null>(null);
++  const recorderRef = useRef<MediaRecorder | null>(null);
++  const chunksRef = useRef<Blob[]>([]);
++  const speechStartedAtRef = useRef<number | null>(null);
++  const silenceStartedAtRef = useRef<number | null>(null);
++  const loudStartedAtRef = useRef<number | null>(null);
++  const turnLockRef = useRef(false);
++  const abortRef = useRef<AbortController | null>(null);
++  const sessionRef = useRef(0);
++
++  const setPhaseBoth = useCallback((next: VoicePhase) => {
++    phaseRef.current = next;
++    setPhase(next);
++  }, []);
++
++  const cleanupRecorder = useCallback(() => {
++    const recorder = recorderRef.current;
++    if (recorder && recorder.state !== 'inactive') {
++      try {
++        recorder.stop();
++      } catch {
++        // ignore
++      }
++    }
++    recorderRef.current = null;
++    chunksRef.current = [];
++  }, []);
++
++  const stopMonitor = useCallback(() => {
++    if (rafRef.current != null) {
++      cancelAnimationFrame(rafRef.current);
++      rafRef.current = null;
++    }
++    cleanupRecorder();
++    stopSpeaking();
++    abortRef.current?.abort();
++    abortRef.current = null;
++    streamRef.current?.getTracks().forEach((t) => t.stop());
++    streamRef.current = null;
++    if (audioCtxRef.current) {
++      audioCtxRef.current.close().catch(() => {});
++      audioCtxRef.current = null;
++    }
++    analyserRef.current = null;
++    meterBufRef.current = null;
++    speechStartedAtRef.current = null;
++    silenceStartedAtRef.current = null;
++    loudStartedAtRef.current = null;
++    turnLockRef.current = false;
++  }, [cleanupRecorder]);
++
++  const askJarvis = useCallback(async (text: string): Promise<string> => {
++    const store = useAppStore.getState();
++    const model = store.selectedModel;
++    if (!model) {
++      throw new Error('Pick a model first');
++    }
++
++    let convId = store.activeId;
++    if (!convId) {
++      convId = store.createConversation(model);
++    }
++
++    const userMsg: ChatMessage = {
++      id: generateId(),
++      role: 'user',
++      content: text,
++      timestamp: Date.now(),
++    };
++    store.addMessage(convId, userMsg);
++
++    const assistantMsg: ChatMessage = {
++      id: generateId(),
++      role: 'assistant',
++      content: '',
++      timestamp: Date.now(),
++    };
++    store.addMessage(convId, assistantMsg);
++    store.setStreamState({ isStreaming: true, phase: 'Thinking...', content: '', elapsedMs: 0 });
++
++    const history = useAppStore
++      .getState()
++      .messages.filter((m) => m.role === 'user' || m.role === 'assistant')
++      .map((m) => ({ role: m.role, content: m.content }));
++
++    // Keep prompts short for snappier spoken replies.
++    const messages = [
++      {
++        role: 'system',
++        content:
++          'You are Jarvis, a calm capable personal assistant. Reply in 1-2 short spoken sentences. No markdown, no lists, no emojis.',
++      },
++      ...history,
++    ];
++
++    const controller = new AbortController();
++    abortRef.current = controller;
++    let accumulated = '';
++
++    try {
++      for await (const sseEvent of streamChat(
++        {
++          model,
++          messages,
++          stream: true,
++          temperature: store.settings.temperature,
++          max_tokens: Math.min(store.settings.maxTokens, 256),
++        },
++        controller.signal,
++      )) {
++        if (!enabledRef.current) break;
++        if (sseEvent.data) {
++          try {
++            const parsed = JSON.parse(sseEvent.data);
++            const delta = parsed?.choices?.[0]?.delta?.content;
++            if (typeof delta === 'string' && delta) {
++              accumulated += delta;
++              store.setStreamState({ content: accumulated, phase: '' });
++              store.updateLastAssistant(convId!, accumulated);
++            }
++          } catch {
++            // ignore non-JSON SSE lines
++          }
++        }
++      }
++    } finally {
++      store.resetStream();
++      if (abortRef.current === controller) abortRef.current = null;
++    }
++
++    if (!accumulated.trim()) {
++      accumulated = "I didn't catch a clear response just now.";
++      store.updateLastAssistant(convId!, accumulated);
++    }
++    return accumulated.trim();
++  }, []);
++
++  const finishUtterance = useCallback(async () => {
++    if (!enabledRef.current || turnLockRef.current) return;
++    const recorder = recorderRef.current;
++    if (!recorder || recorder.state !== 'recording') return;
++
++    turnLockRef.current = true;
++    setPhaseBoth('thinking');
++
++    const blob: Blob = await new Promise((resolve, reject) => {
++      recorder.onstop = () => {
++        const audioBlob = new Blob(chunksRef.current, {
++          type: recorder.mimeType || 'audio/webm',
++        });
++        chunksRef.current = [];
++        recorderRef.current = null;
++        resolve(audioBlob);
++      };
++      recorder.onerror = () => reject(new Error('Recording failed'));
++      try {
++        recorder.stop();
++      } catch (err) {
++        reject(err);
++      }
++    });
++
++    try {
++      if (blob.size < 1000) {
++        // Too short / likely noise.
++        if (enabledRef.current) setPhaseBoth('listening');
++        return;
++      }
++      const result = await transcribeAudio(blob);
++      const text = (result.text || '').trim();
++      if (!text || text.length < 2) {
++        if (enabledRef.current) setPhaseBoth('listening');
++        return;
++      }
++
++      const reply = await askJarvis(text);
++      if (!enabledRef.current) return;
++
++      setPhaseBoth('speaking');
++      await speakText(reply);
++      if (enabledRef.current) setPhaseBoth('listening');
++    } catch (err) {
++      if (!enabledRef.current) return;
++      const msg = err instanceof Error ? err.message : String(err);
++      // Abort from barge-in / disable should not look like a hard failure.
++      if (/abort/i.test(msg)) {
++        setPhaseBoth('listening');
++        return;
++      }
++      setError(msg);
++      setPhaseBoth('error');
++      // Recover to listening so the loop continues.
++      setTimeout(() => {
++        if (enabledRef.current) {
++          setError(null);
++          setPhaseBoth('listening');
++        }
++      }, 1200);
++    } finally {
++      turnLockRef.current = false;
++      speechStartedAtRef.current = null;
++      silenceStartedAtRef.current = null;
++      loudStartedAtRef.current = null;
++    }
++  }, [askJarvis, setPhaseBoth]);
++
++  const beginRecording = useCallback(() => {
++    const stream = streamRef.current;
++    if (!stream || recorderRef.current) return;
++    const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
++      ? 'audio/webm;codecs=opus'
++      : undefined;
++    const recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
++    chunksRef.current = [];
++    recorder.ondataavailable = (e) => {
++      if (e.data.size > 0) chunksRef.current.push(e.data);
++    };
++    recorder.start(200);
++    recorderRef.current = recorder;
++    speechStartedAtRef.current = performance.now();
++    silenceStartedAtRef.current = null;
++    setPhaseBoth('recording');
++  }, [setPhaseBoth]);
++
++  const interruptAndListen = useCallback(() => {
++    stopSpeaking();
++    abortRef.current?.abort();
++    abortRef.current = null;
++    turnLockRef.current = false;
++    if (phaseRef.current === 'recording') return;
++    beginRecording();
++  }, [beginRecording]);
++
++  const tick = useCallback(() => {
++    if (!enabledRef.current) return;
++    const analyser = analyserRef.current;
++    const buf = meterBufRef.current;
++    if (!analyser || !buf) return;
++
++    const level = rmsFromAnalyser(analyser, buf);
++    const now = performance.now();
++    const phaseNow = phaseRef.current;
++
++    // Thresholds: lower while listening, higher while Jarvis is speaking (echo guard).
++    const startThreshold = phaseNow === 'speaking' ? 0.09 : 0.045;
++    const continueThreshold = 0.03;
++    const speechStartMs = phaseNow === 'speaking' ? 140 : 180;
++    const silenceEndMs = 700;
++
++    if (phaseNow === 'listening' || phaseNow === 'speaking') {
++      if (level >= startThreshold) {
++        if (loudStartedAtRef.current == null) loudStartedAtRef.current = now;
++        if (now - loudStartedAtRef.current >= speechStartMs) {
++          if (phaseNow === 'speaking') interruptAndListen();
++          else beginRecording();
++          loudStartedAtRef.current = null;
++        }
++      } else {
++        loudStartedAtRef.current = null;
++      }
++    } else if (phaseNow === 'recording') {
++      if (level >= continueThreshold) {
++        silenceStartedAtRef.current = null;
++      } else {
++        if (silenceStartedAtRef.current == null) silenceStartedAtRef.current = now;
++        const spokenFor = speechStartedAtRef.current
++          ? now - speechStartedAtRef.current
++          : 0;
++        if (
++          spokenFor > 350 &&
++          now - (silenceStartedAtRef.current || now) >= silenceEndMs
++        ) {
++          void finishUtterance();
++        }
++      }
++    }
++
++    rafRef.current = requestAnimationFrame(tick);
++  }, [beginRecording, finishUtterance, interruptAndListen]);
++
++  const startMonitor = useCallback(async () => {
++    setError(null);
++    const stream = await navigator.mediaDevices.getUserMedia({
++      audio: {
++        echoCancellation: true,
++        noiseSuppression: true,
++        autoGainControl: true,
++      },
++    });
++    streamRef.current = stream;
++    const ctx = new AudioContext();
++    audioCtxRef.current = ctx;
++    const source = ctx.createMediaStreamSource(stream);
++    const analyser = ctx.createAnalyser();
++    analyser.fftSize = 2048;
++    source.connect(analyser);
++    analyserRef.current = analyser;
++    meterBufRef.current = new Uint8Array(analyser.fftSize);
++    setPhaseBoth('listening');
++    rafRef.current = requestAnimationFrame(tick);
++  }, [setPhaseBoth, tick]);
++
++  const enable = useCallback(async () => {
++    if (enabledRef.current) return;
++    const [stt, tts] = await Promise.all([
++      fetchSpeechHealth().catch(() => ({ available: false })),
++      fetchTtsHealth().catch(() => ({ available: false })),
++    ]);
++    setStatus({ stt: !!stt.available, tts: !!tts.available });
++    if (!stt.available) {
++      setError('Speech-to-text backend unavailable');
++      return;
++    }
++    if (!tts.available) {
++      setError('Text-to-speech backend unavailable');
++      return;
++    }
++    sessionRef.current += 1;
++    enabledRef.current = true;
++    setEnabled(true);
++    try {
++      await startMonitor();
++    } catch {
++      enabledRef.current = false;
++      setEnabled(false);
++      setPhaseBoth('off');
++      setError('Microphone access denied');
++    }
++  }, [setPhaseBoth, startMonitor]);
++
++  const disable = useCallback(() => {
++    enabledRef.current = false;
++    setEnabled(false);
++    stopMonitor();
++    setPhaseBoth('off');
++    setError(null);
++  }, [setPhaseBoth, stopMonitor]);
++
++  const toggle = useCallback(() => {
++    if (enabledRef.current) disable();
++    else void enable();
++  }, [disable, enable]);
++
++  useEffect(() => {
++    return () => {
++      enabledRef.current = false;
++      stopMonitor();
++    };
++  }, [stopMonitor]);
++
++  return {
++    enabled,
++    phase,
++    error,
++    status,
++    enable,
++    disable,
++    toggle,
++  };
++}
+diff --git a/frontend/src/lib/api.ts b/frontend/src/lib/api.ts
+index d1476e5..e876930 100644
+--- a/frontend/src/lib/api.ts
++++ b/frontend/src/lib/api.ts
+@@ -411,28 +411,44 @@ export async function synthesizeSpeech(
+ }
+ 
+ let _speakAudio: HTMLAudioElement | null = null;
++let _speakResolve: (() => void) | null = null;
+ 
+-/** Speak text aloud via the server TTS endpoint. Stops any previous clip. */
++/** Stop any in-progress spoken reply (used for barge-in / Voice Mode interrupt). */
++export function stopSpeaking(): void {
++  if (_speakAudio) {
++    _speakAudio.pause();
++    _speakAudio.src = '';
++    _speakAudio = null;
++  }
++  if (_speakResolve) {
++    const resolve = _speakResolve;
++    _speakResolve = null;
++    resolve();
++  }
++}
++
++/** Speak text aloud via the server TTS endpoint. Resolves when playback ends or is stopped. */
+ export async function speakText(text: string): Promise<void> {
+   const trimmed = text.trim();
+   if (!trimmed) return;
++  stopSpeaking();
+   const blob = await synthesizeSpeech(trimmed);
+   const url = URL.createObjectURL(blob);
+-  if (_speakAudio) {
+-    _speakAudio.pause();
+-    _speakAudio.src = '';
+-  }
+   const audio = new Audio(url);
+   _speakAudio = audio;
+-  audio.onended = () => {
+-    URL.revokeObjectURL(url);
+-    if (_speakAudio === audio) _speakAudio = null;
+-  };
+-  audio.onerror = () => {
+-    URL.revokeObjectURL(url);
+-    if (_speakAudio === audio) _speakAudio = null;
+-  };
+-  await audio.play();
++
++  await new Promise<void>((resolve) => {
++    const finish = () => {
++      URL.revokeObjectURL(url);
++      if (_speakAudio === audio) _speakAudio = null;
++      if (_speakResolve === finish) _speakResolve = null;
++      resolve();
++    };
++    _speakResolve = finish;
++    audio.onended = finish;
++    audio.onerror = finish;
++    audio.play().catch(() => finish());
++  });
+ }
+ 
+ // ---------------------------------------------------------------------------
+-- 
+2.43.0
+
